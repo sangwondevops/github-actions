@@ -1,0 +1,193 @@
+name: cicd-5
+on:
+  push:
+    paths:
+    - 'my-app/**'
+    tags:
+    - 'v[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    types: [opened, synchronize, closed]
+    branches: [dev, master]
+    paths:
+    - 'my-app/**'
+
+jobs:
+  test:
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout the code
+      uses: actions/checkout@v4
+    - name: checkout the module code
+      uses: actions/checkout@v4
+      with:
+        repository: "sangwon-action/github-actions-module"
+        path: ./actions-module
+    - name: use test module
+      uses: ./actions-module/common/test
+      with:
+        NODE_VERSION: '18'
+        WORKING_DIRECTORY: 'my-app' 
+
+  set-environment:
+    if: github.event.pull_request.merged == true || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+    - name: checkout the module code
+      uses: actions/checkout@v4
+      with:
+        repository: "sangwon-action/github-actions-module"
+        path: ./actions-module
+    - name: use set-environment module
+      uses: ./actions-module/common/set-environment
+      id: set-env
+      with:
+        REF_TYPE: ${{ github.ref_type }}
+        BASE_REF: ${{ github.base_ref }}
+
+
+  image-build:
+    runs-on: ubuntu-latest
+    needs: [set-environment]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        environment: ["${{ needs.set-environment.outputs.environment }}"]
+    environment: ${{ matrix.environment }}
+    steps:
+    - name: checkout the code
+      uses: actions/checkout@v4
+    - name: checkout the module code
+      uses: actions/checkout@v4
+      with:
+        repository: "sangwon-action/github-actions-module"
+        path: ./actions-module
+    - name: use aws module
+      uses: ./actions-module/common/aws
+      with:
+        AWS_REGION: ${{ vars.AWS_REGION }}
+        AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+    - name: use image-build module
+      uses: ./actions-module/common/image-build
+      with:
+        REPOSITORY: ${{ vars.REPOSITORY }}
+        REGISTRY: ${{ secrets.REGISTRY }}
+    
+
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [ set-environment, image-build ]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        environment: ["${{ needs.set-environment.outputs.environment }}"]
+    environment: ${{ matrix.environment }}  
+    steps:
+    - name: checkout the code
+      uses: actions/checkout@v4
+    - name: checkout the module code
+      uses: actions/checkout@v4
+      with:
+        repository: "sangwon-action/github-actions-module"
+        path: ./actions-module
+    - name: use aws module
+      uses: ./actions-module/common/aws
+      with:
+        AWS_REGION: ${{ vars.AWS_REGION }}
+        AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+    - name: use deploy module
+      id: status
+      uses: ./actions-module/common/deploy
+      with:
+        CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+        RELEASE_NAME: my-app
+        HELM_CHART_PATH: kubernetes/my-app
+        NAMESPACE: my-app-${{ vars.SUFFIX }}
+        REPOSITORY: ${{ secrets.REGISTRY }}/${{ vars.REPOSITORY }}
+    - name: use slack module
+      if: always()
+      uses: ./actions-module/common/slack
+      with:
+        DEPLOY_STEP_STATUS: ${{ steps.status.outcome }}
+        ENVIRONMENT: ${{ matrix.environment }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+
+
+  create-pr:
+    if: needs.set-environment.outputs.environment == 'qa'
+    runs-on: ubuntu-latest
+    needs: [set-environment, deploy]
+    steps:
+    - name: checkout
+      uses: actions/checkout@v4
+    - name: checkout the module code
+      uses: actions/checkout@v4
+      with:
+        repository: "sangwon-action/github-actions-module"
+        path: ./actions-module
+    - name: use create-pr module
+      uses: ./actions-module/common/create-pr
+      with:
+        PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        HEAD: release/${{ github.ref_name }}
+        BASE: master
+
+
+
+  approve:
+    if: needs.set-environment.outputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    environment: approve-process
+    needs: [set-environment, deploy]
+    steps:
+    - name: approve
+      run: |
+        echo "Approve Done"
+
+  prod-deploy:
+    runs-on: ubuntu-latest
+    needs: [ approve ]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        environment: ["prod"]
+    environment: ${{ matrix.environment }}  
+    steps:
+    - name: checkout the code
+      uses: actions/checkout@v4
+    - name: checkout the module code
+      uses: actions/checkout@v4
+      with:
+        repository: "sangwon-action/github-actions-module"
+        path: ./actions-module
+    - name: use aws module
+      uses: ./actions-module/common/aws
+      with:
+        AWS_REGION: ${{ vars.AWS_REGION }}
+        AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+    - name: use deploy module
+      id: status
+      uses: ./actions-module/common/deploy
+      with:
+        CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+        RELEASE_NAME: my-app
+        HELM_CHART_PATH: kubernetes/my-app
+        NAMESPACE: my-app-${{ vars.SUFFIX }}
+        REPOSITORY: ${{ secrets.REGISTRY }}/${{ vars.REPOSITORY }}
+    - name: use slack module
+      if: always()
+      uses: ./actions-module/common/slack
+      with:
+        DEPLOY_STEP_STATUS: ${{ steps.status.outcome }}
+        ENVIRONMENT: ${{ matrix.environment }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
